@@ -1,4 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spinlock"]
+members = ["channel","spinlock"]
 
+[workspace.dependencies]
+atomic-wait = "1.1.0"

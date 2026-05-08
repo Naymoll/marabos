@@ -184,6 +184,6 @@ mod tests {
         });
 
         let guard = lock.lock();
-        assert!(guard.as_slice() == &[1, 2, 3] || guard.as_slice() == &[2, 3, 1]);
+        assert!(guard.as_slice() == [1, 2, 3] || guard.as_slice() == [2, 3, 1]);
     }
 }
