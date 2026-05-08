@@ -1,4 +1,6 @@
-use std::{
+#![no_std]
+
+use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
@@ -37,7 +39,7 @@ impl<T> SpinLock<T> {
         loop {
             // "Test" - Look at the value without trying to write to it.
             if self.locked.load(Ordering::Relaxed) {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -48,7 +50,7 @@ impl<T> SpinLock<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
 
@@ -77,7 +79,7 @@ impl<T> SpinLock<T> {
 
             // If we failed to grab it, we sit in a read-only loop until the lock appears free again.
             while self.locked.load(Ordering::Relaxed) {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 continue;
             }
         }
@@ -150,11 +152,13 @@ unsafe impl<'a, T> Sync for Guard<'a, T> where T: Sync {}
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use crate::SpinLock;
 
     #[test]
     fn base_test() {
-        let lock = SpinLock::new(Vec::new());
+        let lock = SpinLock::new(std::vec::Vec::new());
         std::thread::scope(|s| {
             s.spawn(|| lock.lock().push(1));
             s.spawn(|| lock.lock().push(2));
@@ -169,7 +173,7 @@ mod tests {
 
     #[test]
     fn ordering_test() {
-        let lock = SpinLock::new(Vec::new());
+        let lock = SpinLock::new(std::vec::Vec::new());
         std::thread::scope(|s| {
             s.spawn(|| lock.lock().push(1));
             s.spawn(|| {
