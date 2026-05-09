@@ -8,9 +8,10 @@ use std::{
 };
 
 const EMPTY: u32 = 0;
-const SENT: u32 = 1;
-const RECEIVED: u32 = 2;
-const CLOSED: u32 = 3;
+const WRITING: u32 = 1;
+const SENT: u32 = 2;
+const RECEIVED: u32 = 3;
+const CLOSED: u32 = 4;
 
 /// Creates a single-use channel.
 ///
@@ -25,6 +26,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 struct Slot<T> {
     // The value is synchronized by `state`:
     // - EMPTY    => uninitialized
+    // - WRITING  => sender reserved the slot, value is not published yet
     // - SENT     => initialized and stored in the slot
     // - RECEIVED => moved out by the receiver
     // - CLOSED   => no value is stored
@@ -32,7 +34,7 @@ struct Slot<T> {
 
     // Slot state and futex-style wait word.
     //
-    // The receiver waits while this is `EMPTY`.
+    // The receiver waits while this is `EMPTY` or `WRITING`.
     // Any transition that may wake it must update this word first.
     state: AtomicU32,
 }
@@ -70,71 +72,48 @@ unsafe impl<T: Send> Sync for Slot<T> {}
 
 #[derive(Debug)]
 pub struct Sender<T> {
-    channel: Arc<Slot<T>>,
+    slot: Arc<Slot<T>>,
 }
 
 impl<T> Sender<T> {
     #[inline]
-    const fn new(channel: Arc<Slot<T>>) -> Self {
-        Self { channel }
+    const fn new(slot: Arc<Slot<T>>) -> Self {
+        Self { slot }
     }
 
     /// Sends a value into the channel.
     ///
-    /// ### Returns ###
-    /// * `Ok(())` means the value was published.
-    /// * `Err(value)` if the receiver was already dropped.
+    /// # Returns
+    /// * `Ok(())` if the value was published into the slot.
+    /// * `Err(value)` if the receiver was already closed.
     pub fn send(self, value: T) -> Result<(), T> {
+        match self
+            .slot
+            .state
+            .compare_exchange(EMPTY, WRITING, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(EMPTY) => {}
+            Err(CLOSED) => return Err(value),
+            Ok(_state) | Err(_state) => cfg_select! {
+                test => unreachable!("wrong channel state: {_state}"),
+                // SAFETY:
+                // With one non-Clone sender, one non-Clone receiver, and a
+                // private `Slot`, no other state is reachable here.
+                _ => unsafe { std::hint::unreachable_unchecked() }
+            },
+        }
+
         unsafe {
             // SAFETY:
             // The receiver may read `value` only after `SENT` is published with `Release`.
-            let ptr = self.channel.value.get();
+            let ptr = self.slot.value.get();
             (*ptr).write(value);
         }
 
-        match self
-            .channel
-            .state
-            .compare_exchange(EMPTY, SENT, Ordering::Release, Ordering::Relaxed)
-        {
-            Ok(EMPTY) => {
-                // Publish succeeded; wake a possibly waiting receiver.
-                atomic_wait::wake_one(&self.channel.state);
-                Ok(())
-            }
-            Err(CLOSED) => {
-                // Receiver is gone, so take the value back.
-                let value = unsafe {
-                    // SAFETY:
-                    // We wrote this value above, but never published `SENT`.
-                    let ptr = self.channel.value.get();
-                    (*ptr).assume_init_read()
-                };
+        self.slot.state.store(SENT, Ordering::Release);
+        atomic_wait::wake_one(&self.slot.state);
 
-                Err(value)
-            }
-            Ok(_state) | Err(_state) => cfg_select! {
-                test => {{
-                    // Clean up the written value before panicking in tests.
-                    let value = unsafe {
-                        // SAFETY:
-                        // The value was written above and was not published.
-                        let ptr = self.channel.value.get();
-                        (*ptr).assume_init_read()
-                    };
-
-                    drop(value);
-
-                    unreachable!("wrong channel state: {_state}")
-                }}
-                _ => unsafe {
-                    // SAFETY:
-                    // With one non-Clone sender, one non-Clone receiver, and a
-                    // private `Slot`, no other state is reachable here.
-                    std::hint::unreachable_unchecked();
-                }
-            },
-        }
+        Ok(())
     }
 }
 
@@ -142,25 +121,25 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // If no value was sent, close the channel and wake the receiver.
         if self
-            .channel
+            .slot
             .state
             .compare_exchange(EMPTY, CLOSED, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            atomic_wait::wake_one(&self.channel.state);
+            atomic_wait::wake_one(&self.slot.state);
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Receiver<T> {
-    channel: Arc<Slot<T>>,
+    slot: Arc<Slot<T>>,
 }
 
 impl<T> Receiver<T> {
     #[inline]
-    const fn new(channel: Arc<Slot<T>>) -> Self {
-        Self { channel }
+    const fn new(slot: Arc<Slot<T>>) -> Self {
+        Self { slot }
     }
 
     /// Receives the value from the channel.
@@ -170,22 +149,21 @@ impl<T> Receiver<T> {
         // Wait in a loop: futex-style waits may return spuriously, and wake-up
         // only means the state may have changed.
         loop {
-            match self.channel.state.load(Ordering::Acquire) {
-                EMPTY => atomic_wait::wait(&self.channel.state, EMPTY),
+            match self.slot.state.load(Ordering::Acquire) {
+                EMPTY => atomic_wait::wait(&self.slot.state, EMPTY),
+                WRITING => atomic_wait::wait(&self.slot.state, WRITING),
                 SENT => {
                     let value = unsafe {
                         // SAFETY:
                         // `Acquire` on `SENT` synchronizes with sender's `Release`.
-                        let ptr = self.channel.value.get();
+                        let ptr = self.slot.value.get();
                         (*ptr).assume_init_read()
                     };
 
                     // Prevent `Slot::drop` from dropping the value again.
                     //
-                    // `Relaxed` is enough because this transition does not publish any
-                    // additional memory to the sender. The sender only needs to observe
-                    // whether the state changed from `EMPTY`` to `CLOSED`.
-                    self.channel.state.store(RECEIVED, Ordering::Relaxed);
+                    // `Relaxed` is enough: this does not publish data to another thread.
+                    self.slot.state.store(RECEIVED, Ordering::Relaxed);
 
                     return Some(value);
                 }
@@ -194,7 +172,7 @@ impl<T> Receiver<T> {
                     test => unreachable!("wrong channel state: {_state}"),
                     _ => unsafe {
                         // SAFETY:
-                        // Only EMPTY, SENT, RECEIVED, and CLOSED are valid states,
+                        // Only EMPTY, WRITING, SENT, RECEIVED, and CLOSED are valid states,
                         // and RECEIVED is unreachable before `receive` returns.
                         std::hint::unreachable_unchecked();
                     }
@@ -212,12 +190,10 @@ impl<T> Drop for Receiver<T> {
         // `Relaxed` is enough because this transition does not publish any
         // additional memory to the sender. The sender only needs to observe
         // whether the state changed from `EMPTY`` to `CLOSED`.
-        let _ = self.channel.state.compare_exchange(
-            EMPTY,
-            CLOSED,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let _ =
+            self.slot
+                .state
+                .compare_exchange(EMPTY, CLOSED, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
